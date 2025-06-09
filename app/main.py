@@ -1,292 +1,204 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
 import time
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.config import settings
-from app.api.endpoints import transcription, jobs, admin
+from app.api.endpoints.transcription import router as transcription_router
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Tiempo de inicio para uptime
-app_start_time = time.time()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Gestión del ciclo de vida de la aplicación
-    """
-    # Startup
-    logger.info("🚀 Iniciando Whisper Transcription API")
-    logger.info(f"📋 Configuración:")
-    logger.info(f"   - Modelo: {settings.MODEL_SIZE}")
-    logger.info(f"   - Trabajos concurrentes: {settings.MAX_CONCURRENT_JOBS}")
-    logger.info(f"   - Dispositivo: {settings.DEVICE}")
-    logger.info(f"   - Redis: {settings.REDIS_HOST}:{settings.REDIS_PORT}")
+    """Gestión de ciclo de vida ultra-optimizada"""
 
-    # Verificar conexiones iniciales
+    # === STARTUP ===
+    logger.info("🚀 Iniciando Whisper API Always-On")
+
     try:
-        from app.core.redis_queue import job_queue
         from app.core.whisper_service import whisper_service
 
-        # Test Redis
-        if job_queue.health_check():
-            logger.info("✅ Redis conectado")
-        else:
-            logger.warning("⚠️ Redis no disponible")
-
-        # Test GPU
-        gpu_info = whisper_service.get_gpu_info()
-        if gpu_info.get("available"):
-            logger.info(f"✅ GPU disponible: {gpu_info.get('device_name')}")
-        else:
-            logger.warning("⚠️ GPU no disponible, usando CPU")
-
-        # Test modelo
-        models_count = whisper_service.get_available_models_count()
-        logger.info(f"✅ {models_count}/{settings.MAX_CONCURRENT_JOBS} modelos cargados")
+        # El modelo se carga automáticamente en whisper_service
+        logger.info("✅ Whisper service (always-loaded mode)")
 
     except Exception as e:
-        logger.error(f"❌ Error durante inicialización: {e}")
+        logger.error(f"❌ Error startup: {e}")
 
-    logger.info("🎯 API lista para recibir requests")
+    logger.info("🎯 API always-on lista - Modelo pre-cargado")
 
     yield
 
-    # Shutdown
-    logger.info("🛑 Cerrando Whisper Transcription API")
-    logger.info("🧹 Limpiando recursos...")
+    # === SHUTDOWN ===
+    logger.info("🛑 Cerrando API...")
 
     try:
         from app.core.whisper_service import whisper_service
-        whisper_service.cleanup_memory()
-        logger.info("✅ Memoria GPU limpiada")
+        # En always-on mode, force_unload no hace nada
+        await whisper_service.force_unload()
+        logger.info("✅ Shutdown completado")
     except Exception as e:
-        logger.warning(f"⚠️ Error limpiando memoria: {e}")
-
-    logger.info("👋 API cerrada exitosamente")
+        logger.warning(f"⚠️ Error en shutdown: {e}")
 
 
-# Crear aplicación FastAPI
+# === APLICACIÓN ALWAYS-ON ===
 app = FastAPI(
-    title=settings.API_TITLE,
-    description=settings.API_DESCRIPTION,
-    version=settings.API_VERSION,
+    title="Whisper API Always-On Ultra-Optimizada",
+    description="Transcripción directa con modelo siempre cargado - Máxima velocidad",
+    version="3.0.0",
     debug=settings.DEBUG,
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url=None
 )
 
-# Configurar CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # En producción, especificar dominios exactos
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === MIDDLEWARE ESENCIAL ===
+if settings.RESPONSE_COMPRESSION:
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-
-# Middleware para logging de requests
+# Middleware ultra-rápido
 @app.middleware("http")
-async def log_requests(request, call_next):
-    """Middleware para loggear requests"""
+async def ultra_fast_middleware(request: Request, call_next):
+    """Middleware optimizado - solo timing"""
     start_time = time.time()
-
-    # Procesar request
     response = await call_next(request)
 
-    # Calcular tiempo de procesamiento
-    process_time = time.time() - start_time
-
-    # Log del request
-    logger.info(
-        f"{request.method} {request.url.path} - "
-        f"Status: {response.status_code} - "
-        f"Time: {process_time:.3f}s"
-    )
-
-    # Agregar header con tiempo de procesamiento
-    response.headers["X-Process-Time"] = str(process_time)
+    process_time = (time.time() - start_time) * 1000
+    response.headers["X-Process-Time"] = f"{process_time:.1f}ms"
 
     return response
 
-
-# Manejador global de excepciones
+# === MANEJADORES DE ERRORES ===
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """Manejador global de excepciones no capturadas"""
-    logger.error(f"Error no manejado en {request.method} {request.url}: {exc}")
+async def global_exception_handler(request: Request, exc: Exception):
+    """Manejador global ultra-simple"""
+    logger.error(f"❌ Error: {request.method} {request.url.path} - {exc}")
 
     return JSONResponse(
         status_code=500,
         content={
             "error": "Error interno del servidor",
-            "details": "Se ha producido un error inesperado. Por favor, inténtelo más tarde.",
-            "request_id": str(int(time.time() * 1000))  # Simple request ID
+            "timestamp": int(time.time()),
+            "path": str(request.url.path)
         }
     )
 
-
-# Manejador para HTTPException
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Manejador para excepciones HTTP"""
-    logger.warning(f"HTTP {exc.status_code} en {request.method} {request.url}: {exc.detail}")
-
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "status_code": exc.status_code
-        }
-    )
-
-
-# Incluir routers de endpoints
+# === ROUTER PRINCIPAL ===
 app.include_router(
-    transcription.router,
+    transcription_router,
     prefix="/api/v1",
-    tags=["Transcripción"],
-    responses={
-        400: {"description": "Error en la solicitud"},
-        404: {"description": "Recurso no encontrado"},
-        500: {"description": "Error interno del servidor"}
-    }
+    tags=["Transcripción Always-On"]
 )
 
-app.include_router(
-    jobs.router,
-    prefix="/api/v1/jobs",
-    tags=["Trabajos"],
-    responses={
-        500: {"description": "Error interno del servidor"}
-    }
-)
-
-app.include_router(
-    admin.router,
-    prefix="/api/v1/admin",
-    tags=["Administración"],
-    responses={
-        500: {"description": "Error interno del servidor"}
-    }
-)
-
-
-# Endpoints raíz
+# === ENDPOINTS RAÍZ ===
 @app.get("/")
 async def root():
-    """
-    Endpoint raíz con información básica de la API
-    """
+    """Endpoint raíz con información de la API always-on"""
     try:
-        from app.core.redis_queue import job_queue
         from app.core.whisper_service import whisper_service
+        from app.api.endpoints.transcription import simple_state
 
-        # Obtener estadísticas básicas
-        queue_stats = job_queue.get_queue_stats()
-        models_available = whisper_service.get_available_models_count()
-        uptime = time.time() - app_start_time
+        service_status = await whisper_service.get_status()
 
         return {
-            "message": "🎤 Whisper Transcription API",
-            "version": settings.API_VERSION,
-            "status": "operational",
-            "uptime_seconds": uptime,
-            "configuration": {
-                "model": settings.MODEL_SIZE,
-                "max_concurrent_jobs": settings.MAX_CONCURRENT_JOBS,
-                "max_file_size_mb": settings.MAX_FILE_SIZE // (1024 * 1024),
-                "supported_formats": settings.ALLOWED_EXTENSIONS
+            "service": "Whisper API Always-On Ultra-Optimizada",
+            "version": "3.0.0",
+            "mode": "always_loaded",
+            "description": "Modelo siempre cargado → Máxima velocidad constante",
+            "status": "processing" if simple_state["is_processing"] else "ready",
+            "current_load": {
+                "is_processing": simple_state["is_processing"],
+                "can_accept": not simple_state["is_processing"] and service_status["can_accept_jobs"],
+                "current_job": simple_state.get("current_job"),
+                "model_uptime_hours": service_status.get("uptime_hours", 0)
             },
-            "current_stats": {
-                "models_available": models_available,
-                "pending_jobs": queue_stats.get("pending", 0),
-                "processing_jobs": queue_stats.get("processing", 0),
-                "completed_today": queue_stats.get("completed_today", 0)
+            "config": {
+                "model": settings.MODEL_SIZE,
+                "max_file_mb": settings.MAX_FILE_SIZE // (1024 * 1024),
+                "supported_formats": settings.ALLOWED_EXTENSIONS,
+                "always_loaded": True,
+                "lazy_loading": False
+            },
+            "performance": {
+                "model_preloaded": service_status.get("model_loaded", False),
+                "total_transcriptions": service_status.get("total_transcriptions", 0),
+                "estimated_response_time": "~70 segundos constante",
+                "no_loading_delays": True
             },
             "endpoints": {
-                "transcribe": "/api/v1/transcribe",
-                "health": "/api/v1/admin/health",
-                "queue_stats": "/api/v1/jobs/queue",
-                "documentation": "/docs"
+                "transcribe": "POST /api/v1/transcribe (modelo pre-cargado)",
+                "status": "GET /api/v1/status",
+                "health": "GET /api/v1/health",
+                "cancel": "POST /api/v1/cancel",
+                "docs": "/docs"
+            },
+            "usage": {
+                "simple": "curl -F 'file=@audio.mp3' http://localhost:8000/api/v1/transcribe",
+                "check_status": "curl http://localhost:8000/api/v1/status",
+                "if_busy": "Recibirás HTTP 202 con 'retry_after' si está procesando"
+            },
+            "hardware": {
+                "device": settings.DEVICE,
+                "compute_type": settings.COMPUTE_TYPE,
+                "memory_mb": round(service_status["memory_info"].get("ram_usage_mb", 0), 1),
+                "gpu_memory_mb": round(service_status["memory_info"].get("gpu_memory_allocated_mb", 0), 1)
             }
         }
 
     except Exception as e:
-        logger.error(f"Error en endpoint raíz: {e}")
+        logger.error(f"❌ Error endpoint raíz: {e}")
         return {
-            "message": "🎤 Whisper Transcription API",
-            "version": settings.API_VERSION,
+            "service": "Whisper API Always-On",
             "status": "degraded",
-            "error": "Error obteniendo estadísticas"
+            "error": "Error obteniendo estado completo",
+            "mode": "always_loaded",
+            "note": "El modelo debería estar cargándose en background"
         }
 
-
-@app.get("/favicon.ico")
-async def favicon():
-    """Evitar logs de error por favicon"""
-    return JSONResponse(status_code=204, content=None)
-
-
-# Endpoint de versión
-@app.get("/version")
-async def get_version():
-    """Información de versión"""
-    return {
-        "version": settings.API_VERSION,
-        "api_title": settings.API_TITLE,
-        "model_size": settings.MODEL_SIZE
-    }
-
-
-# Endpoint de métricas básicas (para monitoreo)
 @app.get("/metrics")
-async def get_metrics():
-    """
-    Métricas básicas en formato simple para monitoreo externo
-    """
+async def minimal_metrics():
+    """Métricas básicas para monitoreo"""
     try:
-        from app.core.redis_queue import job_queue
         from app.core.whisper_service import whisper_service
-        import torch
+        from app.api.endpoints.transcription import simple_state
 
-        queue_stats = job_queue.get_queue_stats()
-        gpu_memory = 0
-
-        if torch.cuda.is_available():
-            gpu_memory = torch.cuda.memory_allocated() / (1024**2)
+        service_status = await whisper_service.get_status()
 
         return {
-            "whisper_pending_jobs": queue_stats.get("pending", 0),
-            "whisper_processing_jobs": queue_stats.get("processing", 0),
-            "whisper_completed_today": queue_stats.get("completed_today", 0),
-            "whisper_failed_today": queue_stats.get("failed_today", 0),
-            "whisper_models_available": whisper_service.get_available_models_count(),
-            "whisper_gpu_memory_mb": gpu_memory,
-            "whisper_uptime_seconds": time.time() - app_start_time,
-            "whisper_average_speed": queue_stats.get("average_speed", 0)
+            "whisper_processing": 1 if simple_state["is_processing"] else 0,
+            "whisper_available": 1 if service_status["can_accept_jobs"] and not simple_state["is_processing"] else 0,
+            "whisper_model_loaded": 1 if service_status["model_loaded"] else 0,
+            "whisper_model_always_loaded": 1 if service_status.get("model_always_loaded", False) else 0,
+            "whisper_uptime_hours": service_status.get("uptime_hours", 0),
+            "whisper_total_transcriptions": service_status.get("total_transcriptions", 0),
+            "whisper_memory_mb": service_status["memory_info"].get("ram_usage_mb", 0),
+            "whisper_gpu_memory_mb": service_status["memory_info"].get("gpu_memory_allocated_mb", 0)
         }
 
     except Exception as e:
-        logger.error(f"Error obteniendo métricas: {e}")
-        return {"error": "Error obteniendo métricas"}
+        logger.error(f"❌ Error métricas: {e}")
+        return {"error": "métricas no disponibles"}
 
+@app.get("/favicon.ico")
+async def favicon():
+    """Evitar logs 404 de favicon"""
+    return JSONResponse(status_code=204, content=None)
 
+# === STARTUP DIRECTO ===
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("🚀 Iniciando servidor directamente...")
+    logger.info("🚀 Iniciando servidor always-on directo...")
 
     uvicorn.run(
         "app.main:app",
         host=settings.HOST,
         port=settings.PORT,
-        workers=settings.WORKERS,
-        log_level=settings.LOG_LEVEL.lower(),
-        access_log=True,
-        reload=settings.DEBUG
+        workers=1,
+        log_level="warning",
+        access_log=False,
+        reload=False
     )

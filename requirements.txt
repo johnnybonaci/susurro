@@ -1,0 +1,31 @@
+# Requirements Ultra-Minimalistas para Máxima Eficiencia
+# Solo dependencias esenciales, versiones optimizadas
+
+# === CORE API ===
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+uvloop==0.19.0; sys_platform != "win32"
+
+# === WHISPER OPTIMIZADO ===
+faster-whisper==0.9.0
+torch==2.1.1
+torchaudio==2.1.1
+
+# === REDIS MINIMALISTA ===
+redis==5.0.1
+hiredis==2.2.3  # Parser C++ para máxima velocidad
+
+# === I/O ASÍNCRONO ===
+aiofiles==23.2.1
+
+# === CONFIGURACIÓN ===
+pydantic-settings==2.0.3
+
+# === UTILS MÍNIMOS ===
+psutil==5.9.6  # Solo para métricas sistema
+python-multipart==0.0.6  # Para upload archivos
+
+# === OPCIONAL - DESARROLLO ===
+# uvicorn[standard]==0.24.0  # Ya incluido arriba
+# pytest==7.4.3  # Solo para testing
+# httpx==0.25.2  # Solo para testing API

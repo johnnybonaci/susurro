@@ -1,272 +1,424 @@
 import os
 import uuid
+import asyncio
 import aiofiles
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from app.models.schemas import TranscriptionResponse, TranscriptionResult, JobStatusResponse
-from app.core.redis_queue import job_queue
-from app.core.whisper_service import whisper_service
+import time
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from typing import Dict, Any, Optional
+
 from app.config import settings
+from app.core.whisper_service import whisper_service
+from app.core.redis_semaphore import processing_semaphore
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
 
 
-async def process_transcription_job(job_id: str, file_path: str):
-    """
-    Función background para procesar transcripción
-    Usa exactamente tu lógica de transcripción optimizada
-    """
+class ValidationError(Exception):
+    """Error de validación rápida"""
+    pass
+
+
+async def ultra_fast_validation(file: UploadFile) -> Dict[str, Any]:
+    """Validación ultra-rápida sin operaciones costosas"""
+
+    if not file.filename:
+        raise ValidationError("Nombre de archivo requerido")
+
+    # Validar extensión
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in settings.ALLOWED_EXTENSIONS:
+        raise ValidationError(
+            f"Formato no soportado: {file_ext}. "
+            f"Permitidos: {', '.join(settings.ALLOWED_EXTENSIONS)}"
+        )
+
+    # Validar tamaño si está disponible
+    if hasattr(file, 'size') and file.size:
+        if file.size > settings.MAX_FILE_SIZE:
+            size_mb = file.size / (1024 * 1024)
+            max_mb = settings.MAX_FILE_SIZE / (1024 * 1024)
+            raise ValidationError(
+                f"Archivo muy grande: {size_mb:.1f}MB. Máximo: {max_mb}MB"
+            )
+
+    return {
+        "filename": file.filename,
+        "extension": file_ext,
+        "size": getattr(file, 'size', None)
+    }
+
+
+async def stream_file_to_disk(file: UploadFile, filepath: str) -> int:
+    """Guardar archivo usando streaming para memoria mínima"""
+    total_size = 0
+    chunk_size = 8192  # 8KB chunks
+
     try:
-        logger.info(f"Iniciando procesamiento del trabajo {job_id}")
+        async with aiofiles.open(filepath, 'wb') as f:
+            while chunk := await file.read(chunk_size):
+                total_size += len(chunk)
+                if total_size > settings.MAX_FILE_SIZE:
+                    await f.close()
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    raise ValidationError(
+                        f"Archivo excede tamaño máximo: {total_size / (1024 * 1024):.1f}MB"
+                    )
+                await f.write(chunk)
 
-        # Transcribir usando tu servicio optimizado
-        result = whisper_service.transcribe_audio(file_path)
-
-        # Completar trabajo con éxito
-        job_queue.complete_job(job_id, result, success=True)
-
-        logger.info(f"Trabajo {job_id} completado exitosamente")
+        return total_size
 
     except Exception as e:
-        logger.error(f"Error procesando trabajo {job_id}: {e}")
-
-        # Marcar trabajo como fallido
-        job_queue.complete_job(job_id, {"error": str(e)}, success=False)
-
-    finally:
-        # Limpiar archivo temporal
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.debug(f"Archivo temporal eliminado: {file_path}")
-        except Exception as e:
-            logger.warning(f"No se pudo eliminar archivo temporal {file_path}: {e}")
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except:
+                pass
+        raise
 
 
-@router.post("/transcribe", response_model=TranscriptionResponse)
-async def create_transcription(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
+@router.post("/transcribe")
+async def transcribe_audio_sync(file: UploadFile = File(...)) -> JSONResponse:
     """
-    Subir archivo de audio para transcripción
+    Endpoint de transcripción síncrona con control Redis robusto
 
-    - **file**: Archivo de audio (mp3, wav, m4a, flac, ogg)
-    - Returns: ID del trabajo y estado inicial
+    - Verifica estado con Redis antes de procesar
+    - Solo permite un proceso a la vez
+    - Responde inmediatamente si está ocupado
     """
+    start_time = time.time()
 
-    # === VALIDACIONES ===
+    # === VERIFICAR ESTADO CON REDIS (< 5ms) ===
+    if await processing_semaphore.is_processing():
+        # Sistema ocupado, obtener detalles del proceso actual
+        current_status = await processing_semaphore.get_current_status()
 
-    # Validar extensión de archivo
-    file_extension = os.path.splitext(file.filename)[1].lower()
-    if file_extension not in settings.ALLOWED_EXTENSIONS:
-        raise HTTPException(
+        if current_status:
+            return JSONResponse(
+                status_code=202,  # Accepted - Processing
+                content={
+                    "status": "processing",
+                    "message": "Sistema procesando otro audio",
+                    "current_job": current_status.get("job_id"),
+                    "current_filename": current_status.get("filename"),
+                    "elapsed_seconds": current_status.get("elapsed_seconds", 0),
+                    "estimated_remaining_seconds": current_status.get("estimated_remaining_seconds", 30),
+                    "retry_after": 10,
+                    "response_time_ms": round((time.time() - start_time) * 1000, 1)
+                },
+                headers={
+                    "Retry-After": "10",
+                    "X-Processing-Status": "busy",
+                    "X-Current-Job": current_status.get("job_id", "unknown")
+                }
+            )
+
+    # === VALIDACIONES RÁPIDAS ===
+    try:
+        file_info = await ultra_fast_validation(file)
+    except ValidationError as e:
+        return JSONResponse(
             status_code=400,
-            detail=f"Formato no soportado. Formatos permitidos: {', '.join(settings.ALLOWED_EXTENSIONS)}"
+            content={
+                "error": "Error de validación",
+                "details": str(e),
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            }
         )
 
-    # Validar tamaño de archivo
-    if file.size and file.size > settings.MAX_FILE_SIZE:
-        size_mb = file.size / (1024 * 1024)
-        max_mb = settings.MAX_FILE_SIZE / (1024 * 1024)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Archivo muy grande ({size_mb:.1f}MB). Tamaño máximo: {max_mb:.0f}MB"
-        )
-
-    # Validar disponibilidad del sistema
-    if whisper_service.get_available_models_count() == 0:
-        current_stats = job_queue.get_queue_stats()
-        raise HTTPException(
+    # === VERIFICAR SERVICIO WHISPER ===
+    if not await whisper_service.can_process_job():
+        return JSONResponse(
             status_code=503,
-            detail=f"Sistema ocupado. Trabajos en proceso: {current_stats['processing']}/{settings.MAX_CONCURRENT_JOBS}"
+            content={
+                "error": "Servicio Whisper no disponible",
+                "message": "Modelo no cargado o sistema ocupado",
+                "retry_after": 15,
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            },
+            headers={"Retry-After": "15"}
         )
 
-    # === PROCESAMIENTO ===
+    # === INTENTAR ADQUIRIR LOCK ===
+    job_id = str(uuid.uuid4())[:8]
+    temp_filename = f"{job_id}{file_info['extension']}"
+    temp_path = os.path.join(settings.UPLOAD_DIR, temp_filename)
 
-    # Generar ID único para el trabajo
-    job_id = str(uuid.uuid4())
-
+    # Streaming del archivo primero (para obtener tamaño real)
     try:
-        # Guardar archivo temporal
-        temp_filename = f"{job_id}{file_extension}"
-        temp_path = os.path.join(settings.UPLOAD_DIR, temp_filename)
-
-        # Leer y guardar archivo de forma asíncrona
-        content = await file.read()
-        async with aiofiles.open(temp_path, 'wb') as f:
-            await f.write(content)
-
-        # Preparar datos del trabajo
-        job_data = {
-            "filename": file.filename,
-            "file_path": temp_path,
-            "file_size": len(content),
-            "file_extension": file_extension
-        }
-
-        # Agregar trabajo a la cola Redis
-        queue_position = job_queue.add_job(job_id, job_data)
-
-        # Agregar tarea background para procesamiento
-        background_tasks.add_task(process_transcription_job, job_id, temp_path)
-
-        # Calcular tiempo estimado de espera
-        stats = job_queue.get_queue_stats()
-        avg_speed = stats.get("average_speed", 20)  # Default 20x como tu script
-        estimated_minutes = max(1, queue_position * 2)  # Estimación conservadora
-        estimated_wait = f"~{estimated_minutes} min" if queue_position > 0 else "procesando pronto"
-
-        logger.info(f"Trabajo {job_id} creado para archivo '{file.filename}' (posición {queue_position})")
-
-        return TranscriptionResponse(
-            job_id=job_id,
-            status="pending",
-            queue_position=queue_position,
-            estimated_wait_time=estimated_wait,
-            message=f"Archivo '{file.filename}' agregado a la cola"
+        file_size = await stream_file_to_disk(file, temp_path)
+    except ValidationError as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Error procesando archivo",
+                "details": str(e),
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Error interno guardando archivo",
+                "details": str(e),
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            }
         )
 
-    except Exception as e:
-        logger.error(f"Error creando trabajo de transcripción: {e}")
+    # Preparar info del job
+    job_info = {
+        "filename": file_info["filename"],
+        "file_size": file_size,
+        "extension": file_info["extension"]
+    }
 
-        # Limpiar archivo temporal si se creó
+    # Intentar adquirir lock
+    lock_acquired = await processing_semaphore.acquire_lock(job_id, job_info)
+
+    if not lock_acquired:
+        # No se pudo adquirir lock, limpiar archivo y retornar ocupado
         try:
-            if 'temp_path' in locals() and os.path.exists(temp_path):
+            if os.path.exists(temp_path):
                 os.remove(temp_path)
         except:
             pass
 
-        raise HTTPException(
+        # Obtener estado actual
+        current_status = await processing_semaphore.get_current_status()
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "message": "Sistema ocupado, otro proceso en curso",
+                "current_job": current_status.get("job_id", "unknown") if current_status else "unknown",
+                "retry_after": 10,
+                "note": "Tu archivo fue validado correctamente, reintenta en unos segundos",
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            },
+            headers={"Retry-After": "10"}
+        )
+
+    # === PROCESAMIENTO CON LOCK ADQUIRIDO ===
+    try:
+        logger.info(f"🎤 Iniciando transcripción {job_id}: {file_info['filename']} ({file_size} bytes)")
+
+        # Transcripción directa
+        result = await whisper_service.transcribe_audio(temp_path)
+
+        # Agregar metadatos
+        result.update({
+            "job_id": job_id,
+            "filename": file_info["filename"],
+            "file_size": file_size,
+            "status": "completed",
+            "total_time": time.time() - start_time,
+            "response_time_ms": round((time.time() - start_time) * 1000, 1)
+        })
+
+        logger.info(f"✅ Transcripción {job_id} completada en {result['total_time']:.2f}s (velocidad: {result.get('speed', 0):.1f}x)")
+
+        return JSONResponse(
+            status_code=200,
+            content=result,
+            headers={
+                "X-Job-ID": job_id,
+                "X-Processing-Time": f"{result['total_time']:.2f}s",
+                "X-Speed": f"{result.get('speed', 0):.1f}x",
+                "X-File-Size": str(file_size)
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error transcripción {job_id}: {e}")
+
+        return JSONResponse(
             status_code=500,
-            detail=f"Error interno del servidor: {str(e)}"
+            content={
+                "error": "Error durante transcripción",
+                "details": str(e),
+                "job_id": job_id,
+                "response_time_ms": round((time.time() - start_time) * 1000, 1)
+            }
         )
 
+    finally:
+        # === LIMPIEZA GARANTIZADA ===
 
-@router.get("/status/{job_id}", response_model=JobStatusResponse)
-async def get_transcription_status(job_id: str):
-    """
-    Obtener estado actual de un trabajo de transcripción
-
-    - **job_id**: ID del trabajo
-    - Returns: Estado actual y información del progreso
-    """
-
-    # Obtener datos del trabajo
-    job_data = job_queue.get_job(job_id)
-    if not job_data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Trabajo {job_id} no encontrado"
-        )
-
-    response_data = {
-        "job_id": job_id,
-        "status": job_data.get("status"),
-        "filename": job_data.get("filename"),
-        "created_at": job_data.get("created_at"),
-        "started_at": job_data.get("started_at")
-    }
-
-    # Si está pendiente, agregar posición en cola
-    if job_data.get("status") == "pending":
-        queue_position = job_queue.get_job_position(job_id)
-        if queue_position:
-            response_data["queue_position"] = queue_position
-            response_data["message"] = f"En cola, posición {queue_position}"
-        else:
-            response_data["message"] = "Preparando para procesar"
-
-    elif job_data.get("status") == "processing":
-        response_data["message"] = "Transcribiendo audio..."
-
-    elif job_data.get("status") == "completed":
-        response_data["message"] = "Transcripción completada"
-
-    elif job_data.get("status") == "failed":
-        response_data["message"] = f"Error: {job_data.get('error', 'Error desconocido')}"
-
-    return JobStatusResponse(**response_data)
-
-
-@router.get("/result/{job_id}", response_model=TranscriptionResult)
-async def get_transcription_result(job_id: str):
-    """
-    Obtener resultado completo de una transcripción
-
-    - **job_id**: ID del trabajo
-    - Returns: Texto transcrito y métricas de rendimiento
-    """
-
-    # Obtener datos del trabajo
-    job_data = job_queue.get_job(job_id)
-    if not job_data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Trabajo {job_id} no encontrado"
-        )
-
-    # Si no está completado, devolver estado actual
-    if job_data.get("status") != "completed":
-        if job_data.get("status") == "failed":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Trabajo falló: {job_data.get('error', 'Error desconocido')}"
-            )
-        else:
-            raise HTTPException(
-                status_code=202,  # Accepted - still processing
-                detail=f"Trabajo aún en estado: {job_data.get('status')}"
-            )
-
-    # Devolver resultado completo
-    return TranscriptionResult(
-        **job_data
-    )
-
-
-@router.delete("/job/{job_id}")
-async def delete_transcription_job(job_id: str):
-    """
-    Eliminar un trabajo de transcripción
-
-    - **job_id**: ID del trabajo a eliminar
-    - Returns: Confirmación de eliminación
-    """
-
-    # Verificar que el trabajo existe
-    job_data = job_queue.get_job(job_id)
-    if not job_data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Trabajo {job_id} no encontrado"
-        )
-
-    # No permitir eliminar trabajos en proceso
-    if job_data.get("status") == "processing":
-        raise HTTPException(
-            status_code=400,
-            detail="No se puede eliminar un trabajo que se está procesando"
-        )
-
-    # Eliminar archivo temporal si existe
-    file_path = job_data.get("file_path")
-    if file_path and os.path.exists(file_path):
+        # 1. Liberar lock Redis
         try:
-            os.remove(file_path)
-            logger.info(f"Archivo temporal eliminado: {file_path}")
+            await processing_semaphore.release_lock(job_id)
         except Exception as e:
-            logger.warning(f"No se pudo eliminar archivo {file_path}: {e}")
+            logger.error(f"❌ Error liberando lock {job_id}: {e}")
 
-    # Eliminar trabajo de Redis
-    deleted = job_queue.delete_job(job_id)
+        # 2. Limpiar archivo temporal
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                logger.debug(f"🗑️ Archivo temporal eliminado: {temp_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo eliminar {temp_path}: {e}")
 
-    if deleted:
-        logger.info(f"Trabajo {job_id} eliminado por usuario")
-        return {"message": f"Trabajo {job_id} eliminado exitosamente"}
-    else:
-        raise HTTPException(
+
+@router.get("/status")
+async def get_processing_status() -> JSONResponse:
+    """
+    Estado actual del sistema con información Redis
+    """
+    start_time = time.time()
+
+    try:
+        # Estado del procesamiento desde Redis
+        current_status = await processing_semaphore.get_current_status()
+        is_processing = await processing_semaphore.is_processing()
+
+        # Estado del servicio Whisper
+        service_status = await whisper_service.get_status()
+
+        # Construir respuesta
+        response_data = {
+            "system_status": "processing" if is_processing else "available",
+            "is_processing": is_processing,
+            "can_accept_new": not is_processing and service_status["can_accept_jobs"],
+            "redis_connected": await processing_semaphore.health_check()
+        }
+
+        # Agregar detalles del proceso actual si existe
+        if current_status:
+            response_data.update({
+                "current_process": {
+                    "job_id": current_status.get("job_id"),
+                    "filename": current_status.get("filename"),
+                    "elapsed_seconds": current_status.get("elapsed_seconds"),
+                    "estimated_remaining": current_status.get("estimated_remaining_seconds"),
+                    "file_size_mb": round(current_status.get("file_size", 0) / (1024 * 1024), 2)
+                }
+            })
+
+        # Información del servicio
+        response_data.update({
+            "service_info": {
+                "model_loaded": service_status["model_loaded"],
+                "memory_usage_mb": round(service_status["memory_info"].get("ram_usage_mb", 0), 1),
+                "gpu_memory_mb": round(service_status["memory_info"].get("gpu_memory_allocated_mb", 0), 1)
+            },
+            "configuration": {
+                "model_size": settings.MODEL_SIZE,
+                "max_file_size_mb": settings.MAX_FILE_SIZE // (1024 * 1024),
+                "supported_formats": settings.ALLOWED_EXTENSIONS,
+                "lazy_loading": settings.LAZY_MODEL_LOADING
+            },
+            "response_time_ms": round((time.time() - start_time) * 1000, 1)
+        })
+
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo status: {e}")
+        return JSONResponse(
             status_code=500,
-            detail="Error eliminando trabajo"
+            content={
+                "error": "Error obteniendo estado del sistema",
+                "details": str(e)
+            }
+        )
+
+
+@router.post("/cancel")
+async def cancel_processing() -> JSONResponse:
+    """
+    Cancelar procesamiento actual (liberación forzada del lock)
+    """
+    try:
+        current_status = await processing_semaphore.get_current_status()
+
+        if not current_status:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "No hay procesamiento en curso",
+                    "status": "idle"
+                }
+            )
+
+        # Forzar liberación del lock
+        released = await processing_semaphore.force_release()
+
+        if released:
+            job_id = current_status.get("job_id", "unknown")
+            logger.info(f"🛑 Procesamiento {job_id} cancelado forzadamente")
+
+            return JSONResponse(content={
+                "message": f"Procesamiento {job_id} cancelado",
+                "previous_job": job_id,
+                "note": "Lock liberado, sistema disponible para nuevos requests",
+                "status": "cancelled"
+            })
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "No se pudo cancelar el procesamiento",
+                    "note": "Reintentar o esperar a que termine naturalmente"
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"❌ Error cancelando: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Error durante cancelación",
+                "details": str(e)
+            }
+        )
+
+
+@router.get("/health")
+async def health_check() -> JSONResponse:
+    """Health check con verificación Redis"""
+    try:
+        # Verificar componentes
+        redis_ok = await processing_semaphore.health_check()
+        service_status = await whisper_service.get_status()
+        is_processing = await processing_semaphore.is_processing()
+
+        # Determinar estado general
+        if not redis_ok:
+            status = "unhealthy"
+        elif is_processing:
+            status = "processing"
+        elif not service_status["can_accept_jobs"]:
+            status = "degraded"
+        else:
+            status = "healthy"
+
+        return JSONResponse(content={
+            "status": status,
+            "components": {
+                "redis": redis_ok,
+                "whisper_service": service_status["can_accept_jobs"],
+                "model_loaded": service_status["model_loaded"]
+            },
+            "processing": {
+                "is_processing": is_processing,
+                "can_accept_requests": not is_processing and redis_ok
+            },
+            "memory": {
+                "ram_mb": round(service_status["memory_info"].get("ram_usage_mb", 0), 1),
+                "gpu_mb": round(service_status["memory_info"].get("gpu_memory_allocated_mb", 0), 1)
+            }
+        })
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "unhealthy",
+                "error": str(e)
+            }
         )

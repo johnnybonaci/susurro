@@ -4,67 +4,72 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # === CONFIGURACIÓN WHISPER ===
+    # === CONFIGURACIÓN WHISPER OPTIMIZADA ===
     MODEL_SIZE: str = "small"
-    MAX_CONCURRENT_JOBS: int = 3
-    MAX_FILE_SIZE: int = 500 * 1024 * 1024  # 500MB
+    MAX_CONCURRENT_JOBS: int = 1  # Dinámico: 1-3
+    MAX_FILE_SIZE: int = 25 * 1024 * 1024  # 25MB (reducido)
     UPLOAD_DIR: str = "temp_uploads"
 
-    # === CONFIGURACIÓN WHISPER OPTIMIZADA ===
+    # === OPTIMIZACIÓN MEMORIA EXTREMA ===
+    LAZY_MODEL_LOADING: bool = True  # Cargar/descargar bajo demanda
+    MODEL_UNLOAD_TIMEOUT: int = 30  # Segundos antes de descargar modelo
+    AGGRESSIVE_CLEANUP: bool = True  # Limpieza agresiva post-transcripción
+    STREAM_FILE_THRESHOLD: int = 5 * 1024 * 1024  # 5MB - streaming por encima
+
+    # === WHISPER CONFIGURACIÓN MÍNIMA ===
     BEAM_SIZE: int = 1
-    BEST_OF: int = 1
     TEMPERATURE: float = 0.0
     VAD_FILTER: bool = True
-    MIN_SILENCE_DURATION_MS: int = 300
-    VAD_THRESHOLD: float = 0.4
     CHUNK_LENGTH: int = 30
     CONDITION_ON_PREVIOUS_TEXT: bool = False
-    COMPRESSION_RATIO_THRESHOLD: float = 2.4
-    LOG_PROB_THRESHOLD: float = -1.0
-    NO_SPEECH_THRESHOLD: float = 0.6
 
-    # === CONFIGURACIÓN GPU ===
+    # === GPU/CPU OPTIMIZADO ===
     DEVICE: str = "cuda"
-    COMPUTE_TYPE: str = "float16"
-    NUM_WORKERS: int = 1
-    DEVICE_INDEX: int = 0
-    CPU_THREADS: int = 4
+    COMPUTE_TYPE: str = "float16"  # Mínimo para GPU
+    CPU_THREADS: int = 2  # Reducido
 
-    # === CONFIGURACIÓN REDIS ===
+    # === REDIS MINIMALISTA ===
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: Optional[str] = None
+    JOB_TTL: int = 3600  # TTL automático 1 hora
+    RESULT_TTL: int = 1800  # Resultados 30 min
 
-    # === CONFIGURACIÓN API ===
-    API_TITLE: str = "Whisper Transcription API"
-    API_DESCRIPTION: str = "API de transcripción de audio con Faster Whisper"
-    API_VERSION: str = "1.0.0"
-    DEBUG: bool = False
+    # === API ULTRA-RÁPIDA ===
+    RESPONSE_COMPRESSION: bool = True
+    FAST_VALIDATION: bool = True
+    MINIMAL_LOGGING: bool = True
 
-    # === CONFIGURACIÓN SERVIDOR ===
+    # === SERVIDOR LIGERO ===
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    WORKERS: int = 1
+    WORKERS: int = 1  # Siempre 1 para máxima eficiencia
 
-    # === CONFIGURACIÓN LOGS ===
-    LOG_LEVEL: str = "INFO"
-    LOG_FILE: str = "whisper-api.log"
-    LOG_ROTATION: str = "1 day"
-    LOG_RETENTION: str = "7 days"
-
-    # === CONFIGURACIÓN ARCHIVOS ===
+    # === ARCHIVOS ===
     ALLOWED_EXTENSIONS: list = [".mp3", ".wav", ".m4a", ".flac", ".ogg"]
-    CLEANUP_INTERVAL_HOURS: int = 24
-    CLEANUP_AGE_DAYS: int = 7
+    TEMP_FILE_CLEANUP: int = 10  # Minutos para limpiar archivos temp
+
+    # === LOGS MÍNIMOS ===
+    LOG_LEVEL: str = "WARNING"  # Solo errores importantes
+    LOG_FILE: Optional[str] = None  # Sin archivo por defecto
+    DEBUG: bool = False  # Modo debug
 
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"  # Ignorar campos extra en .env
+
+    def update_concurrency(self, new_value: int):
+        """Actualizar concurrencia dinámicamente"""
+        if 1 <= new_value <= 3:
+            self.MAX_CONCURRENT_JOBS = new_value
+            return True
+        return False
 
 
-# Instancia global de configuración
+# Instancia global
 settings = Settings()
 
-# Crear directorio de uploads si no existe
+# Crear directorio uploads si no existe
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)

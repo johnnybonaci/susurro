@@ -1,4 +1,3 @@
-requirements.txt
 venv/
 whisper-env/
 whisper-api.log

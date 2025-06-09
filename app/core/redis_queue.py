@@ -1,382 +1,277 @@
 import redis
 import json
 import time
-from typing import Dict, List, Optional, Tuple, Any
+import asyncio
+from typing import Dict, List, Optional, Any
+from enum import Enum
+
 from app.config import settings
 from app.utils.logger import get_logger
-from app.models.schemas import JobStatus
 
 logger = get_logger(__name__)
 
 
-class RedisJobQueue:
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class OptimizedRedisQueue:
     """
-    Sistema de colas Redis para manejar trabajos de transcripción
-    Mantiene registro persistente de todos los trabajos
+    Cola Redis ultra-optimizada con TTL automático
+    Mínima memoria, máxima velocidad
     """
 
     def __init__(self):
-        """Inicializar conexión a Redis"""
         try:
-            redis_config = {
-                "host": settings.REDIS_HOST,
-                "port": settings.REDIS_PORT,
-                "db": settings.REDIS_DB,
-                "decode_responses": True,
-                "socket_connect_timeout": 5,
-                "socket_timeout": 5,
-                "retry_on_timeout": True
-            }
+            # Configuración Redis optimizada
+            self.redis = redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                password=settings.REDIS_PASSWORD,
+                decode_responses=True,
+                socket_connect_timeout=2,  # Timeout reducido
+                socket_timeout=2,
+                health_check_interval=30,
+                max_connections=10  # Pool pequeño
+            )
 
-            if settings.REDIS_PASSWORD:
-                redis_config["password"] = settings.REDIS_PASSWORD
-
-            self.redis = redis.Redis(**redis_config)
-
-            # Verificar conexión
+            # Test de conexión
             self.redis.ping()
-            logger.info("✅ Conectado a Redis exitosamente")
+            logger.info("✅ Redis conectado")
 
         except Exception as e:
-            logger.error(f"❌ Error conectando a Redis: {e}")
-            raise ConnectionError(f"No se pudo conectar a Redis: {e}")
+            logger.error(f"❌ Error Redis: {e}")
+            raise ConnectionError(f"Redis no disponible: {e}")
 
-        # Definir claves Redis organizadas
+        # Claves Redis minimalistas
         self.keys = {
-            "pending": "whisper:pending",           # Cola de trabajos pendientes
-            "processing": "whisper:processing",     # Set de trabajos en proceso
-            "completed": "whisper:completed",       # Lista de trabajos completados
-            "failed": "whisper:failed",             # Lista de trabajos fallidos
-            "jobs": "whisper:jobs",                 # Hash con datos de todos los trabajos
-            "stats": "whisper:stats",               # Estadísticas globales
-            "speeds": "whisper:speeds"              # Lista de velocidades recientes
+            "pending": "wq:pending",
+            "processing": "wq:processing",
+            "jobs": "wq:jobs:",  # Prefix para jobs individuales
+            "stats": "wq:stats"
         }
 
-    def add_job(self, job_id: str, job_data: Dict[str, Any]) -> int:
-        """
-        Agregar trabajo a la cola
-        Returns: posición en la cola
-        """
+    async def add_job(self, job_id: str, job_data: Dict[str, Any]) -> int:
+        """Agregar trabajo con TTL automático"""
         try:
-            pipeline = self.redis.pipeline()
-
-            # Preparar datos del trabajo
+            # Preparar datos mínimos
             job_data.update({
                 "job_id": job_id,
                 "status": JobStatus.PENDING,
                 "created_at": time.time()
             })
 
-            # Guardar datos del trabajo
-            pipeline.hset(self.keys["jobs"], job_id, json.dumps(job_data))
+            # Pipeline para operaciones atómicas
+            pipe = self.redis.pipeline()
 
-            # Agregar a cola de pendientes (FIFO)
-            pipeline.lpush(self.keys["pending"], job_id)
+            # Guardar job con TTL
+            job_key = f"{self.keys['jobs']}{job_id}"
+            pipe.setex(job_key, settings.JOB_TTL, json.dumps(job_data))
 
-            # Incrementar contador total
-            pipeline.hincrby(self.keys["stats"], "total_jobs", 1)
+            # Agregar a cola de pendientes
+            pipe.lpush(self.keys["pending"], job_id)
 
-            # Ejecutar todas las operaciones
-            pipeline.execute()
+            # Stats mínimos
+            pipe.hincrby(self.keys["stats"], "total", 1)
 
-            # Obtener posición en cola
+            # Ejecutar pipeline
+            pipe.execute()
+
+            # Posición en cola
             position = self.redis.llen(self.keys["pending"])
 
-            logger.info(f"Trabajo {job_id} agregado a cola (posición {position})")
+            logger.info(f"📝 Job {job_id} en posición {position}")
             return position
 
         except Exception as e:
-            logger.error(f"Error agregando trabajo {job_id}: {e}")
+            logger.error(f"❌ Error agregando job {job_id}: {e}")
             raise
 
-    def get_next_job(self, timeout: int = 5) -> Tuple[Optional[str], Optional[Dict]]:
-        """
-        Obtener siguiente trabajo de la cola (operación bloqueante)
-        Returns: (job_id, job_data) o (None, None) si timeout
-        """
+    async def get_next_job(self) -> Optional[Dict[str, Any]]:
+        """Obtener siguiente trabajo (no bloqueante)"""
         try:
-            # Mover atómicamente de pending a processing
-            job_id = self.redis.brpoplpush(
+            # Mover atómicamente a processing
+            job_id = self.redis.rpoplpush(
                 self.keys["pending"],
-                self.keys["processing"],
-                timeout=timeout
+                self.keys["processing"]
             )
 
             if not job_id:
-                return None, None
+                return None
 
-            # Obtener datos del trabajo
-            job_data_str = self.redis.hget(self.keys["jobs"], job_id)
+            # Obtener datos del job
+            job_key = f"{self.keys['jobs']}{job_id}"
+            job_data_str = self.redis.get(job_key)
+
             if not job_data_str:
-                logger.warning(f"No se encontraron datos para trabajo {job_id}")
-                return None, None
+                # Job expiró, limpiar
+                self.redis.lrem(self.keys["processing"], 0, job_id)
+                return None
 
             job_data = json.loads(job_data_str)
 
-            # Actualizar estado a processing
+            # Actualizar estado
             job_data.update({
                 "status": JobStatus.PROCESSING,
                 "started_at": time.time()
             })
 
-            # Guardar cambios
-            self.redis.hset(self.keys["jobs"], job_id, json.dumps(job_data))
+            # Guardar cambios con TTL extendido
+            self.redis.setex(job_key, settings.JOB_TTL, json.dumps(job_data))
 
-            logger.info(f"Trabajo {job_id} obtenido para procesamiento")
-            return job_id, job_data
+            logger.info(f"🔄 Procesando job {job_id}")
+            return job_data
 
         except Exception as e:
-            logger.error(f"Error obteniendo trabajo: {e}")
-            return None, None
+            logger.error(f"❌ Error obteniendo job: {e}")
+            return None
 
-    def update_job(self, job_id: str, updates: Dict[str, Any]):
-        """Actualizar datos de un trabajo"""
+    async def complete_job(self, job_id: str, result: Dict[str, Any], success: bool = True):
+        """Completar trabajo con TTL para resultado"""
         try:
-            current_data_str = self.redis.hget(self.keys["jobs"], job_id)
-            if current_data_str:
-                job_data = json.loads(current_data_str)
-                job_data.update(updates)
-                self.redis.hset(self.keys["jobs"], job_id, json.dumps(job_data))
-                logger.debug(f"Trabajo {job_id} actualizado")
-            else:
-                logger.warning(f"Trabajo {job_id} no encontrado para actualizar")
-        except Exception as e:
-            logger.error(f"Error actualizando trabajo {job_id}: {e}")
+            job_key = f"{self.keys['jobs']}{job_id}"
 
-    def complete_job(self, job_id: str, result: Dict[str, Any], success: bool = True):
-        """Marcar trabajo como completado o fallido"""
-        try:
-            pipeline = self.redis.pipeline()
-
-            # Actualizar datos del trabajo
+            # Actualizar estado
             result.update({
                 "status": JobStatus.COMPLETED if success else JobStatus.FAILED,
                 "completed_at": time.time()
             })
 
-            self.update_job(job_id, result)
+            pipe = self.redis.pipeline()
+
+            # Guardar resultado con TTL más corto
+            ttl = settings.RESULT_TTL if success else 300  # 5 min para errores
+            pipe.setex(job_key, ttl, json.dumps(result))
 
             # Remover de processing
-            pipeline.lrem(self.keys["processing"], 0, job_id)
+            pipe.lrem(self.keys["processing"], 0, job_id)
 
-            # Agregar a lista correspondiente
-            if success:
-                pipeline.lpush(self.keys["completed"], job_id)
-                pipeline.hincrby(self.keys["stats"], "completed_today", 1)
+            # Stats
+            stat_key = "completed" if success else "failed"
+            pipe.hincrby(self.keys["stats"], stat_key, 1)
 
-                # Registrar velocidad para estadísticas
-                if "speed" in result:
-                    pipeline.lpush(self.keys["speeds"], result["speed"])
-                    pipeline.ltrim(self.keys["speeds"], 0, 99)  # Mantener últimas 100
-            else:
-                pipeline.lpush(self.keys["failed"], job_id)
-                pipeline.hincrby(self.keys["stats"], "failed_today", 1)
+            pipe.execute()
 
-            pipeline.execute()
-
-            status_msg = "completado" if success else "fallido"
-            logger.info(f"Trabajo {job_id} {status_msg}")
+            status_msg = "✅ completado" if success else "❌ fallido"
+            logger.info(f"{status_msg}: {job_id}")
 
         except Exception as e:
-            logger.error(f"Error completando trabajo {job_id}: {e}")
+            logger.error(f"❌ Error completando job {job_id}: {e}")
 
-    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """Obtener datos de un trabajo específico"""
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Obtener datos de trabajo"""
         try:
-            job_data_str = self.redis.hget(self.keys["jobs"], job_id)
+            job_key = f"{self.keys['jobs']}{job_id}"
+            job_data_str = self.redis.get(job_key)
+
             if job_data_str:
                 return json.loads(job_data_str)
             return None
+
         except Exception as e:
-            logger.error(f"Error obteniendo trabajo {job_id}: {e}")
+            logger.error(f"❌ Error obteniendo job {job_id}: {e}")
             return None
 
-    def get_queue_stats(self) -> Dict[str, Any]:
-        """Obtener estadísticas de la cola"""
+    async def get_queue_status(self) -> Dict[str, Any]:
+        """Estado rápido de la cola"""
         try:
-            # Contar trabajos en cada estado
-            pending = self.redis.llen(self.keys["pending"])
-            processing = self.redis.llen(self.keys["processing"])
+            pipe = self.redis.pipeline()
 
-            # Estadísticas acumuladas
-            stats = self.redis.hgetall(self.keys["stats"])
-            completed_today = int(stats.get("completed_today", 0))
-            failed_today = int(stats.get("failed_today", 0))
-            total_jobs = int(stats.get("total_jobs", 0))
+            # Conteos básicos
+            pipe.llen(self.keys["pending"])
+            pipe.llen(self.keys["processing"])
+            pipe.hgetall(self.keys["stats"])
 
-            # Calcular velocidad promedio
-            speeds = self.redis.lrange(self.keys["speeds"], 0, -1)
-            average_speed = None
-            if speeds:
-                speeds_float = [float(s) for s in speeds]
-                average_speed = sum(speeds_float) / len(speeds_float)
+            results = pipe.execute()
+
+            pending = results[0]
+            processing = results[1]
+            stats = results[2]
 
             return {
                 "pending": pending,
                 "processing": processing,
-                "completed_today": completed_today,
-                "failed_today": failed_today,
-                "total_jobs": total_jobs,
-                "average_speed": average_speed
+                "completed": int(stats.get("completed", 0)),
+                "failed": int(stats.get("failed", 0)),
+                "total": int(stats.get("total", 0)),
+                "can_accept": processing < settings.MAX_CONCURRENT_JOBS
             }
 
         except Exception as e:
-            logger.error(f"Error obteniendo estadísticas: {e}")
+            logger.error(f"❌ Error stats: {e}")
             return {
                 "pending": 0,
                 "processing": 0,
-                "completed_today": 0,
-                "failed_today": 0,
-                "total_jobs": 0,
-                "average_speed": None
+                "completed": 0,
+                "failed": 0,
+                "total": 0,
+                "can_accept": False
             }
 
-    def get_pending_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Obtener lista de trabajos pendientes"""
+    async def get_job_position(self, job_id: str) -> Optional[int]:
+        """Posición en cola de forma eficiente"""
         try:
-            job_ids = self.redis.lrange(self.keys["pending"], 0, limit - 1)
-            jobs = []
-
-            for job_id in job_ids:
-                job_data = self.get_job(job_id)
-                if job_data:
-                    jobs.append({
-                        "job_id": job_id,
-                        "filename": job_data.get("filename"),
-                        "status": job_data.get("status"),
-                        "created_at": job_data.get("created_at"),
-                        "file_size": job_data.get("file_size")
-                    })
-
-            return jobs
-
-        except Exception as e:
-            logger.error(f"Error obteniendo trabajos pendientes: {e}")
-            return []
-
-    def get_recent_jobs(self, hours: int = 24, limit: int = 100) -> List[Dict[str, Any]]:
-        """Obtener trabajos recientes (completados y fallidos)"""
-        try:
-            cutoff_time = time.time() - (hours * 3600)
-            all_jobs = []
-
-            # Obtener de listas de completados y fallidos
-            for list_key in [self.keys["completed"], self.keys["failed"]]:
-                job_ids = self.redis.lrange(list_key, 0, limit)
-
-                for job_id in job_ids:
-                    job_data = self.get_job(job_id)
-                    if job_data and job_data.get("created_at", 0) > cutoff_time:
-                        all_jobs.append(job_data)
-
-            # Ordenar por created_at descendente
-            all_jobs.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-            return all_jobs[:limit]
-
-        except Exception as e:
-            logger.error(f"Error obteniendo trabajos recientes: {e}")
-            return []
-
-    def get_job_position(self, job_id: str) -> Optional[int]:
-        """Obtener posición de un trabajo en la cola de pendientes"""
-        try:
+            # Obtener lista de pendientes
             pending_jobs = self.redis.lrange(self.keys["pending"], 0, -1)
+
             if job_id in pending_jobs:
-                return pending_jobs.index(job_id) + 1
-            return None
-        except Exception as e:
-            logger.error(f"Error obteniendo posición del trabajo {job_id}: {e}")
+                return len(pending_jobs) - pending_jobs.index(job_id)
             return None
 
-    def delete_job(self, job_id: str) -> bool:
-        """Eliminar trabajo completamente del sistema"""
-        try:
-            pipeline = self.redis.pipeline()
-
-            # Remover de todas las listas
-            pipeline.lrem(self.keys["pending"], 0, job_id)
-            pipeline.lrem(self.keys["processing"], 0, job_id)
-            pipeline.lrem(self.keys["completed"], 0, job_id)
-            pipeline.lrem(self.keys["failed"], 0, job_id)
-
-            # Remover datos del trabajo
-            pipeline.hdel(self.keys["jobs"], job_id)
-
-            results = pipeline.execute()
-
-            # Verificar si se eliminó algo
-            deleted = any(result > 0 for result in results[:-1]) or results[-1] > 0
-
-            if deleted:
-                logger.info(f"Trabajo {job_id} eliminado del sistema")
-            else:
-                logger.warning(f"Trabajo {job_id} no encontrado para eliminar")
-
-            return deleted
-
         except Exception as e:
-            logger.error(f"Error eliminando trabajo {job_id}: {e}")
-            return False
+            logger.error(f"❌ Error posición job {job_id}: {e}")
+            return None
 
-    def cleanup_old_jobs(self, days: int = 7) -> int:
-        """Limpiar trabajos antiguos"""
-        try:
-            cutoff_time = time.time() - (days * 24 * 3600)
-            cleaned = 0
-
-            # Revisar listas de completados y fallidos
-            for list_key in [self.keys["completed"], self.keys["failed"]]:
-                job_ids = self.redis.lrange(list_key, 0, -1)
-
-                for job_id in job_ids:
-                    job_data = self.get_job(job_id)
-                    if job_data and job_data.get("created_at", 0) < cutoff_time:
-                        if self.delete_job(job_id):
-                            cleaned += 1
-
-            logger.info(f"Limpiados {cleaned} trabajos antiguos (>{days} días)")
-            return cleaned
-
-        except Exception as e:
-            logger.error(f"Error limpiando trabajos antiguos: {e}")
-            return 0
-
-    def reset_daily_stats(self):
-        """Resetear estadísticas diarias (para cron job)"""
-        try:
-            pipeline = self.redis.pipeline()
-            pipeline.hset(self.keys["stats"], "completed_today", 0)
-            pipeline.hset(self.keys["stats"], "failed_today", 0)
-            pipeline.execute()
-
-            logger.info("Estadísticas diarias reseteadas")
-
-        except Exception as e:
-            logger.error(f"Error reseteando estadísticas diarias: {e}")
-
-    def get_connection_info(self) -> Dict[str, Any]:
-        """Información de conexión Redis"""
-        try:
-            info = self.redis.info()
-            return {
-                "connected": True,
-                "redis_version": info.get("redis_version"),
-                "used_memory_human": info.get("used_memory_human"),
-                "connected_clients": info.get("connected_clients"),
-                "total_commands_processed": info.get("total_commands_processed")
-            }
-        except Exception as e:
-            logger.error(f"Error obteniendo info de Redis: {e}")
-            return {"connected": False, "error": str(e)}
-
-    def health_check(self) -> bool:
-        """Verificar salud de Redis"""
+    async def health_check(self) -> bool:
+        """Health check rápido"""
         try:
             self.redis.ping()
             return True
-        except Exception:
+        except:
             return False
 
+    async def cleanup_expired(self) -> int:
+        """Limpiar trabajos expirados de las colas"""
+        try:
+            cleaned = 0
 
-# Instancia global de la cola
-job_queue = RedisJobQueue()
+            # Limpiar pending jobs expirados
+            pending_jobs = self.redis.lrange(self.keys["pending"], 0, -1)
+            for job_id in pending_jobs:
+                job_key = f"{self.keys['jobs']}{job_id}"
+                if not self.redis.exists(job_key):
+                    self.redis.lrem(self.keys["pending"], 0, job_id)
+                    cleaned += 1
+
+            # Limpiar processing jobs expirados
+            processing_jobs = self.redis.lrange(self.keys["processing"], 0, -1)
+            for job_id in processing_jobs:
+                job_key = f"{self.keys['jobs']}{job_id}"
+                if not self.redis.exists(job_key):
+                    self.redis.lrem(self.keys["processing"], 0, job_id)
+                    cleaned += 1
+
+            if cleaned > 0:
+                logger.info(f"🧹 Limpiados {cleaned} jobs expirados")
+
+            return cleaned
+
+        except Exception as e:
+            logger.error(f"❌ Error cleanup: {e}")
+            return 0
+
+    async def reset_stats(self):
+        """Reset stats (para maintenance)"""
+        try:
+            self.redis.delete(self.keys["stats"])
+            logger.info("📊 Stats reseteadas")
+        except Exception as e:
+            logger.error(f"❌ Error reset stats: {e}")
+
+
+# Instancia global
+job_queue = OptimizedRedisQueue()
