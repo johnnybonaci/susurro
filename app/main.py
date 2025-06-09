@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.config import settings
-from app.api.endpoints.transcription import router as transcription_router
+from app.api.endpoints.transcription import router as transcription_router, processing_state
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -99,7 +99,6 @@ async def root():
     """Endpoint raíz con información de la API always-on"""
     try:
         from app.core.whisper_service import whisper_service
-        from app.api.endpoints.transcription import simple_state
 
         service_status = await whisper_service.get_status()
 
@@ -108,11 +107,11 @@ async def root():
             "version": "3.0.0",
             "mode": "always_loaded",
             "description": "Modelo siempre cargado → Máxima velocidad constante",
-            "status": "processing" if simple_state["is_processing"] else "ready",
+            "status": "processing" if processing_state["is_processing"] else "ready",
             "current_load": {
-                "is_processing": simple_state["is_processing"],
-                "can_accept": not simple_state["is_processing"] and service_status["can_accept_jobs"],
-                "current_job": simple_state.get("current_job"),
+                "is_processing": processing_state["is_processing"],
+                "can_accept": not processing_state["is_processing"] and service_status["can_accept_jobs"],
+                "current_job": processing_state.get("current_job"),
                 "model_uptime_hours": service_status.get("uptime_hours", 0)
             },
             "config": {
@@ -163,13 +162,12 @@ async def minimal_metrics():
     """Métricas básicas para monitoreo"""
     try:
         from app.core.whisper_service import whisper_service
-        from app.api.endpoints.transcription import simple_state
 
         service_status = await whisper_service.get_status()
 
         return {
-            "whisper_processing": 1 if simple_state["is_processing"] else 0,
-            "whisper_available": 1 if service_status["can_accept_jobs"] and not simple_state["is_processing"] else 0,
+            "whisper_processing": 1 if processing_state["is_processing"] else 0,
+            "whisper_available": 1 if service_status["can_accept_jobs"] and not processing_state["is_processing"] else 0,
             "whisper_model_loaded": 1 if service_status["model_loaded"] else 0,
             "whisper_model_always_loaded": 1 if service_status.get("model_always_loaded", False) else 0,
             "whisper_uptime_hours": service_status.get("uptime_hours", 0),

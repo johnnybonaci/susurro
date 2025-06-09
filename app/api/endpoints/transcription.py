@@ -15,6 +15,12 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
+# Estado simple en memoria (eliminar referencia a simple_state que no existe)
+processing_state = {
+    "is_processing": False,
+    "current_job": None
+}
+
 
 class ValidationError(Exception):
     """Error de validación rápida"""
@@ -90,6 +96,7 @@ async def transcribe_audio_sync(file: UploadFile = File(...)) -> JSONResponse:
     - Responde inmediatamente si está ocupado
     """
     start_time = time.time()
+    global processing_state
 
     # === VERIFICAR ESTADO CON REDIS (< 5ms) ===
     if await processing_semaphore.is_processing():
@@ -205,6 +212,10 @@ async def transcribe_audio_sync(file: UploadFile = File(...)) -> JSONResponse:
 
     # === PROCESAMIENTO CON LOCK ADQUIRIDO ===
     try:
+        # Actualizar estado local
+        processing_state["is_processing"] = True
+        processing_state["current_job"] = job_id
+
         logger.info(f"🎤 Iniciando transcripción {job_id}: {file_info['filename']} ({file_size} bytes)")
 
         # Transcripción directa
@@ -249,13 +260,17 @@ async def transcribe_audio_sync(file: UploadFile = File(...)) -> JSONResponse:
     finally:
         # === LIMPIEZA GARANTIZADA ===
 
-        # 1. Liberar lock Redis
+        # 1. Actualizar estado local
+        processing_state["is_processing"] = False
+        processing_state["current_job"] = None
+
+        # 2. Liberar lock Redis
         try:
             await processing_semaphore.release_lock(job_id)
         except Exception as e:
             logger.error(f"❌ Error liberando lock {job_id}: {e}")
 
-        # 2. Limpiar archivo temporal
+        # 3. Limpiar archivo temporal
         try:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
